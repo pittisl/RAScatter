@@ -1,0 +1,1590 @@
+#!/bin/bash
+#
+# Build script for UHD + GNU Radio + SoapySDR + rtl-sdr on Ubuntu 18.04 / 20.04 LTS
+#
+#
+#
+# Updates: https://github.com/guruofquality/grextras/wiki
+# Updates: https://github.com/balint256/gr-baz.git
+#
+#
+#
+# Exit function--Id like to be able to upload stats to a website somewhere...
+#
+function doexit
+{
+	cat <<"!EOF!"
+
+=======================================================================
+If you have found this script useful and time-saving, consider a 
+donation to help me keep build-gnuradio, simple_ra, SIDsuite,
+meteor_detector, simple_fm_rcv, and multimode maintained and up to date.
+A simple paypal transfer to mleech@ripnet.com is all you need to do.
+======================================================================
+!EOF!
+
+	# echo -n "Send success/fail info to sbrac.org? y / n "
+	# read ans
+	# 	case $ans in
+	# 		y|Y|YES|yes|Yes)
+	# 			wget http://www.sbrac.org/bgrstats.php?status="$1"?systype=${SYSTYPE}?sysinfo="`uname -a`" >/dev/null 2>&1
+	# 			echo Thanks
+	# 			;;
+	# 	esac
+	exit
+}
+	
+function help {
+	cat <<!EOF!
+	
+Usage: build-script [--help|-h] [-v|--verbose] [-jN] [-ja] 
+                      [-l|--logfile logfile ] [-u|--users ulist] [-n] funcs
+
+-v|--verbose    - turn on verbose logging to stdout
+
+-jN             - have make use N concurrent jobs (2-9)
+
+-ja             - have make use N concurrent jobs with auto setting of N
+                 (based on number of cpu cores on build system)
+
+-u|--users ul   - add comma-separated users to 'usrp' group in addition
+                 to calling user ( $USER )
+           
+-n              - dry-run for uninstallation only
+                
+-l|--logfile lf - log messages to 'lf'
+-ut <tag>       - set tag for UHD checkout to <tag>
+-ucf <ucflags>  - set UHD CMake flags to <ucflags>
+-gt <tag>       - set tag for GNU Radio checkout to <tag>
+-gcf <gcflags>  - set GNU Radio CMake flags to <gcflags>
+-e|--extras     - add an item to "extras" to be built after GNU Radio/UHD/gs-osmosdr
+
+Available funcs:
+
+all             - do all functions (default)
+prereqs         - install prerequisites
+gitfetch        - use GIT to fetch GNU Radio, UHD, SoapySDR and others
+uhd_build       - build only UHD
+firmware        - fetch firmware/FPGA
+gnuradio_build  - build only GNU Radio
+rtl_build       - build only rtl-sdr and others
+mod_groups      - modify the /etc/groups and add user to group 'usrp'
+mod_udev        - add UDEV rule for USRP1
+mod_sysctl      - modify SYSCTL for larger net buffers
+SoapySDR        - build only SoapySDR
+LimeSuite       - build only LimeSuite
+G2RFID          - build only Gen2 UHF RFID Reader
+pythonpath      - print out PYTHONPATH
+setenv          - set environment variables for terminal and graphical GNU Radio Companion
+uninstall       - uninstall all packages, remove all downloaded packages and build files
+!EOF!
+
+}
+
+if [ $USER = root -o $UID -eq 0 ]
+then
+	echo Please run this script as an ordinary user
+	echo   it will acquire root privileges as it needs them via \"sudo\".
+	exit
+fi
+
+VERBOSE=No
+JFLAG=""
+DRYRUN=""
+LOGDEV=/dev/null
+USERSLIST=None
+UTAG=None
+GTAG=None
+export LC_LANG=C
+EXTRAS=""
+PULLED_LIST="gnuradio uhd rtl-sdr gr-osmosdr gr-iqbal hackrf bladeRF airspyone_host SoapySDR LimeSuite" # gr-baz not installed?
+which python3 >/dev/null 2>&1
+if [ $? -eq 0 ]
+then
+	CMAKE_FLAG1=""
+	CMAKE_FLAG2=""
+	CMAKE_FLAG3=""
+	# //Path to a program.
+	# PYTHON_EXECUTABLE:FILEPATH=/usr/bin/python3
+
+	# //Path to a file.
+	# PYTHON_INCLUDE_DIR:PATH=/usr/include/python3.6m
+
+	# //Path to a library.
+	# PYTHON_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libpython3.6m.so
+
+fi
+while : 
+do
+	case $1 in
+		-ja)
+			cnt=`grep 'processor.*:' /proc/cpuinfo|wc -l`
+			cnt=`expr $cnt - 1`
+			if [ $cnt -lt 1 ]
+			then
+				cnt=1
+			fi
+			JFLAG=-j$cnt
+			shift
+			;;
+			
+		-j[123456789])
+			JFLAG=$1
+			shift
+			;;
+			
+		-v|--verbose)
+			LOGDEV=/dev/stdout
+			VERBOSE=Yes
+			shift
+			;;
+
+		-n)
+			DRYRUN=-n
+			shift
+			;;
+			
+		-l|--logfile)
+			case $2 in
+				/*)
+					LOGDEV=$2
+				;;
+				*)
+					LOGDEV=`pwd`/$2
+				;;
+			esac
+			shift
+			shift
+			rm -f $LOGDEV
+			echo $LOGDEV Starts at: `date` >>$LOGDEV 2>&1
+			;;
+			
+		-u|--users)
+			USERSLIST=$2
+			shift
+			shift
+			;;
+            
+		-h|--help)
+			help
+			exit
+			;;
+			
+		-ut)
+			UTAG=$2
+			shift
+			shift
+			;;
+			
+		-ucf)
+			UCFLAGS=$2
+			shift 2
+			;;
+			
+		-gt)
+			GTAG=$2
+			shift
+			shift
+			;;
+
+		-gcf)
+			GCFLAGS=$2
+			shift
+			shift
+			;;
+			
+		-e|--extras)
+			EXTRAS=$EXTRAS" "$2
+			shift 2
+			;;
+			
+		-*)
+			echo Unrecognized option: $1
+			echo
+			help
+			exit
+			break
+			;;
+
+		*)
+			break
+			;;
+	esac
+done
+
+CWD="`pwd`"
+SUDOASKED=n
+SYSTYPE=unknown
+good_to_go=no
+for file in /etc/lsb-release
+do
+	if [ -f $file ]
+	then
+		good_to_go=yes
+	fi
+done
+if [ $good_to_go = no ]
+then
+	echo Supported systems: Ubuntu 18.04 / 20.04 LTS
+	echo You appear to be running none of the above, exiting
+	exit
+fi
+
+function installcheck {
+echo ==============================================================================
+echo This script has been modified and only supports Ubuntu 18.04 / 20.04 LTS. 
+echo ==============================================================================
+echo
+echo This script will install UHD driver, GNU Radio, SoapySDR, LimeSuite, 
+echo Gen2 UHF RFID Reader, rtl-sdr, gr-osmosdr, gr-iqbal, hackrf, bladeRF,
+echo airspyone_host from current GIT sources with some version control.
+echo You will require Internet access from the computer on which this
+echo script runs.  You will also require SUDO access.  You will require
+echo approximately 16GB of free disk space to perform the build.
+echo " "
+echo This script will, as a side-effect, remove any existing GNU Radio
+echo installation that was installed from your Linux distribution packages.
+echo It must do this to prevent problems due to interference between
+echo a linux-distribution-installed GNU Radio/UHD and one installed from GIT source.
+echo " "
+echo The whole process may take up to two hours to complete, depending on the
+echo capabilities of your system. A faster CPU with more cores and threads will be
+echo quicker to compile. AMD Ryzen 5 1600 -j11 took \~45 minutes to complete, 
+echo Intel i5-8250U -j7 took \~1 hour 6 minutes to complete,
+echo Intel i5-3230m -j3 took \~1 hour 30 minutes to complete.
+echo
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+echo NOTE: if you run into problems while running this script, you can re-run it with
+echo the --verbose option to produce lots of diagnostic output to help debug problems.
+echo This script has been written to anticipate some of the more common problems one might
+echo encounter building ANY large, complex software package.  But it is not pefect, and
+echo there are certainly some situations it could encounter that it cannot deal with
+echo gracefully.  Altering the system configuration from something reasonably standard,
+echo removing parts of the filesystem, moving system libraries around arbitrarily, etc,
+echo it likely cannot cope with.  It is just a script.  It isn\'t intuitive or artificially
+echo intelligent.  It tries to make life a little easier for you, but at the end of the day
+echo if it runs into trouble, a certain amount of knowledge on your part about
+echo system configuration and idiosyncrasies will inevitably be necessary.
+echo
+echo CWD: "$CWD"
+echo JFLAG: "$JFLAG"
+echo VERBOSE: "$VERBOSE"
+echo
+echo -n "Proceed? (y / n) "
+
+read ans
+case $ans in
+	y|Y|YES|yes|Yes)
+		PROCEED=y
+	;;
+	*)
+		exit
+esac
+
+SPACE=`df $HOME| grep -v blocks|grep '%'`
+SPACE=`echo $SPACE | awk '/./ {n=NF-2; printf ("%d\n", $n/1.0e3)}'`
+
+
+if [ $SPACE -lt 16000 ]
+then
+	echo "You don't appear to have enough free disk space on $HOME"
+	echo to complete this build/install
+	echo exiting
+	doexit DISKSPACE
+fi
+
+total=0
+for file in $PULLED_LIST
+do
+	found=0
+	for instance in ${file}.20*
+	do
+		if [ -d $instance ]
+		then
+			found=1
+			sz=`du -s $instance|awk '{print $1}'`
+			total=`expr $total + $sz`
+		fi
+	done
+done
+total=`expr $total '*' 1024`
+total=`expr $total / 1000000`
+if [ $total -gt 100 ]
+then
+	echo Your old 'uhd.*' and 'gnuradio.*' etc directories are using roughly $total MB
+	echo of disk space:
+	for file in $PULLED_LIST
+	do
+		for instance in ${file}.20*
+		do
+			if [ -d $instance ]
+			then
+				ls -ld $instance
+			fi
+		done
+	done
+	echo " "
+	echo -n "Remove them? (y / n) "
+	read ans
+	
+	case $ans in
+		y|Y|YES|yes|Yes)
+			for file in $PULLED_LIST
+			do
+				for instance in ${file}.20*
+				do
+					if [ -d $instance ]
+					then
+						echo removing ${instance}
+						rm -rf ${instance}
+					fi
+				done
+			done
+			echo Done
+			;;
+	esac
+fi
+rm -rf *.20*.bgmoved
+}
+
+function my_echo {
+	if [ $LOGDEV = /dev/stdout ]
+	then
+		echo $*
+	else
+		echo $*
+		echo $* >>$LOGDEV 2>&1
+	fi
+}
+
+function checkcmd {
+	found=0
+	which $1 >/dev/null 2>&1
+	x=$?
+	if [ $x -eq 0 ]
+	then
+		found=1
+	fi
+	for place in /bin /usr/bin /usr/local/bin /sbin /usr/sbin /usr/local/sbin /opt/bin /opt/local/bin
+	do
+		if [ -e $place/$1 ]
+		then
+			found=1
+		fi
+	done
+	if [ $found -eq 0 ]
+	then
+		which $1 >/dev/null 2>&1
+		if [ $? -eq 0 ]
+		then
+			found=1
+		fi
+	fi
+	if [ $found -eq 0 ]
+	then
+		my_echo Failed to find just-installed command \'$1\' after pre-requisite installation.
+		my_echo This very likely indicates that the pre-requisite installation failed
+		my_echo to install one or more critical pre-requisites for GNU Radio/UHD
+		doexit PREREQFAIL-CMD-$1
+	fi
+}
+
+function checklib {
+	found=0
+	my_echo -n Checking for library $1 ...
+	for dir in /lib /usr/lib /usr/lib64 /lib64 /usr/lib/x86_64-linux-gnu /usr/lib/i386-linux-gnu \
+	    /usr/lib/arm-linux-gnueabihf /usr/lib/arm-linux-gnueabi
+	do
+		for file in $dir/${1}*.so*
+		do
+			if [ -e "$file" ]
+			then
+				found=1
+			fi
+		done
+	done
+	if [ $found -le 0 ]
+	then
+		my_echo Failed to find libraries with prefix \'$1\' after pre-requisite installation.
+		my_echo This very likely indicates that the pre-requisite installation failed
+		my_echo to install one or more critical pre-requisites for GNU Radio/UHD
+		my_echo exiting build
+		doexit PREREQFAIL-LIB-$1
+	else
+		my_echo Found library $1
+	fi
+}
+
+function checkpkg {
+	my_echo Checking for package $1
+	if [ `apt-cache search $1 | wc -l` -eq 0 ]
+	then
+		my_echo Failed to find package \'$1\' in known package repositories
+		my_echo SOME THINGS MAY NOT BUILD AS A RESULT
+		# doexit PREREQFAIL-PKG-$1
+	fi
+}
+		
+function prereqs {
+	sudocheck
+	my_echo Installing prerequisites.
+	my_echo "====>" THIS MAY TAKE QUITE SOME TIME "<====="
+
+	#
+	# It's a Ubuntu system
+	# 
+	if [ -f /etc/lsb-release ]
+	then
+		SYSTYPE=Ubuntu
+		sudo apt-get -y purge 'gnuradio-*' >>$LOGDEV 2>&1
+		sudo apt-get -y purge 'libgruel-*' >>$LOGDEV 2>&1
+		sudo apt-get -y purge 'libgruel*' >>$LOGDEV 2>&1
+		sudo apt-get -y purge 'libgruel0*' >>$LOGDEV 2>&1
+		sudo apt-get -y purge 'libgnuradio*' >>$LOGDEV 2>&1
+		sudo apt-get -y purge 'python-gnuradio*' >>$LOGDEV 2>&1
+		case `grep DISTRIB_RELEASE /etc/lsb-release` in
+		*20.*)
+			PKGLIST="autoconf automake build-essential ccache cmake cpufrequtils doxygen ethtool 
+			fort77 g++ gir1.2-gtk-3.0 git gobject-introspection gpsd gpsd-clients 
+			inetutils-tools libasound2-dev libboost-all-dev libcomedi-dev libcppunit-dev 
+			libfftw3-bin libfftw3-dev libfftw3-doc libfontconfig1-dev libgmp-dev libgps-dev 
+			libgsl-dev liblog4cpp5-dev libncurses5 libncurses5-dev libpulse-dev 
+			libqt5opengl5-dev libqwt-qt5-dev libsdl1.2-dev libtool libudev-dev libusb-1.0-0 
+			libusb-1.0-0-dev libusb-dev libxi-dev libxrender-dev libzmq3-dev libzmq5 
+			ncurses-bin python3-cheetah python3-click python3-click-plugins 
+			python3-click-threading python3-dev python3-docutils python3-gi python3-gi-cairo 
+			python3-gps python3-lxml python3-mako python3-numpy python3-numpy-dbg 
+			python3-opengl python3-pyqt5 python3-requests python3-scipy python3-setuptools 
+			python3-six python3-sphinx python3-yaml python3-zmq swig wget libcodec2-dev 
+			libgsm1-dev libi2c-dev libsqlite3-dev libwxgtk3.0-gtk3-dev freeglut3-dev python3-pip"
+
+			CMAKE_FLAG1=""
+			CMAKE_FLAG2=""
+			CMAKE_FLAG3=""
+			;;
+
+		*18.*)
+			PKGLIST="git swig cmake doxygen build-essential libboost-all-dev libtool libusb-1.0-0 
+			libusb-1.0-0-dev libudev-dev libncurses5-dev libfftw3-bin libfftw3-dev 
+			libfftw3-doc libcppunit-1.14-0 libcppunit-dev libcppunit-doc ncurses-bin 
+			cpufrequtils python-numpy python-numpy-doc python-numpy-dbg python-scipy 
+			python-docutils qt4-bin-dbg qt4-default qt4-doc libqt4-dev libqt4-dev-bin 
+			python-qt4 python-qt4-dbg python-qt4-dev python-qt4-doc libqwt6abi1 libncurses5 
+			libncurses5-dbg libfontconfig1-dev libxrender-dev libpulse-dev g++ automake 
+			autoconf python-dev libusb-dev fort77 libsdl1.2-dev python-wxgtk3.0 ccache 
+			python-opengl libgsl-dev python-cheetah python-mako python-lxml qt4-dev-tools 
+			libqwtplot3d-qt5-dev pyqt4-dev-tools python-qwt5-qt4 wget libxi-dev 
+			gtk2-engines-pixbuf r-base-dev python-tk liborc-0.4-0 liborc-0.4-dev 
+			libasound2-dev python-gtk2 libzmq3-dev libzmq5 python-requests python-sphinx 
+			libcomedi-dev python-zmq libqwt-dev python-six libgps-dev libgps23 gpsd 
+			gpsd-clients python-gps python-setuptools libgmp-dev python3-numpy python3-mako 
+			python3-sphinx python3-lxml libqwt-qt5-dev libqt5opengl5-dev python3-pyqt5 
+			liblog4cpp5-dev python3-yaml python3-click python3-click-plugins python3-zmq python3-scipy
+			libi2c-dev libsqlite3-dev libwxgtk3.0-dev freeglut3-dev python3-pip"
+
+			CMAKE_FLAG1=""
+			CMAKE_FLAG2=""
+			CMAKE_FLAG3=""
+			;;
+
+		*)
+			my_echo Your Ubuntu release not supported--cannot proceed
+			doexit WRONGRELEASE
+			;;
+		esac
+		for pkg in $PKGLIST; do checkpkg $pkg; done
+		my_echo Done checking packages
+		for pkg in $PKGLIST
+		do
+			my_echo Installing $pkg
+			sudo apt-get -y --ignore-missing install $pkg >>$LOGDEV 2>&1
+		done
+		
+	else
+		my_echo This script supports only Ubuntu 18.04 / 20.04 LTS
+		doexit WRONGSYSTEM
+	fi
+	PATH=$PATH
+	export PATH
+
+	checkcmd git
+	checkcmd cmake
+	
+	checklib libusb 2
+	
+	checklib libboost 5
+	checklib libcppunit 0
+	checklib libfftw 5
+	checklib libgsl 0
+	
+	my_echo Done
+}
+
+
+function gitfetch {
+	date=`date +%Y%m%d%H%M%S`
+	echo This script will fetch GNU Radio branch maint-3.8 from the repositories, along with compatible
+	echo extras. If it already exists, it will be renamed with the date appended to the end, and a new
+	echo download will initiate. The versions of each package is:
+	echo GNU Radio 			maint-3.8
+	echo UHD 						3.15 LTS
+	echo rtl-sdr 				master
+	echo gr-osmosdr 		gr3.8
+	echo gr-iqbal 			gr3.8
+	echo hackrf     		master
+	echo bladeRF        master
+	echo airspyone_host master
+	echo SoapySDR       master
+	echo LimeSuite 			stable
+	echo -n "Is this OK? (yes / no / skip) "
+	read ans
+	
+	case $ans in
+		Y|y|YES|yes|Yes)
+			;;
+		N|n|NO|no|No)
+			exit
+			;;
+		S|s|skip|SKIP|Skip)
+			return
+			;;
+		*)
+			exit
+			;;
+	esac
+		
+
+	my_echo "Fetching various packages (GNU Radio, UHD, gr-osmosdr, gr-iqbal, etc)"
+	my_echo "  via the Internet"
+	my_echo "=======> THIS MAY TAKE QUITE SOME TIME <========="
+
+	cd "$CWD"
+	for dir in ${PULLED_LIST}
+	do
+		if [ -d $dir ]
+		then
+			mv $dir ${dir}.$date
+		fi
+	done
+	
+	#
+	# GIT the GNU Radio source tree
+	#
+	rm -rf gnuradio
+	my_echo -n Fetching GNU Radio maint-3.8 via GIT...
+	git clone -b maint-3.8 --single-branch https://github.com/gnuradio/gnuradio.git
+	if [ -d gnuradio ]
+	then
+		cd gnuradio
+		git submodule init  >>$LOGDEV 2>&1
+		git submodule update >>$LOGDEV 2>&1
+		git submodule status >>$LOGDEV 2>&1
+		cd ..
+	fi
+	pip3 install git+https://github.com/pyqtgraph/pyqtgraph@develop
+	cd "$CWD"
+	my_echo Done
+
+	#
+	# GIT the UHD source tree
+	#
+	rm -rf uhd
+	my_echo -n Fetching UHD 3.15 LTS via GIT...
+	git clone -b UHD-3.15.LTS --single-branch https://github.com/EttusResearch/uhd
+	cd "$CWD"
+	
+	#
+	# GIT the RTL-SDR source tree
+	#
+	# rm -rf gr-baz
+	rm -rf rtl-sdr
+	rm -rf gr-osmosdr
+	rm -rf gr-iqbal
+	rm -rf hackrf
+	rm -rf bladeRF
+	rm -rf airspyone_host
+	my_echo Fetching rtl-sdr "(rtl-sdr, gr-osmosdr, gr-iqbal, hackrf, bladeRF and airspyone_host)" via GIT
+	git clone git://git.osmocom.org/rtl-sdr >>$LOGDEV 2>&1
+	git clone -b gr3.8 --single-branch git://git.osmocom.org/gr-osmosdr >>$LOGDEV 2>&1
+	git clone https://github.com/Nuand/bladeRF.git >>$LOGDEV 2>&1
+	git clone https://github.com/mossmann/hackrf.git >>$LOGDEV 2>&1
+	git clone https://github.com/airspy/airspyone_host.git >>$LOGDEV 2>&1
+	git clone git://git.osmocom.org/gr-iqbal.git >>$LOGDEV 2>&1
+	if [ -d gr-iqbal ]
+	then
+		cd gr-iqbal
+		git checkout gr3.8
+		git submodule init  >>$LOGDEV 2>&1
+		git submodule update >>$LOGDEV 2>&1
+		git submodule status >>$LOGDEV 2>&1
+		cd ..
+	fi
+
+	#
+	# GIT the SoapySDR source tree
+	#
+	rm -rf SoapySDR
+	my_echo -n Fetching SoapySDR via GIT...
+	git clone https://github.com/pothosware/SoapySDR.git >>$LOGDEV 2>&1
+
+	#
+	# GIT the LimeSuite source tree
+	#
+	rm -rf LimeSuite
+	my_echo -n Fetching LimeSuite via GIT...
+	git clone https://github.com/myriadrf/LimeSuite.git >>$LOGDEV 2>&1
+	cd LimeSuite
+	git checkout stable >>$LOGDEV 2>&1
+	cd ..
+
+	my_echo Done
+}
+
+function uhd_build {
+	#
+	# UHD build
+	#
+	sudocheck
+	if [ ! -d uhd ]
+	then
+		my_echo you do not appear to have the \'uhd\' directory
+		my_echo you should probably use $0 gitfetch to fetch the appropriate
+		my_echo files using GIT
+		doexit BUILD-UHD-NOT-THERE
+	fi
+	if [ $UTAG != None ]
+	then
+		cd uhd
+		git checkout $UTAG >/dev/null 2>&1
+		cd ..
+	fi
+	my_echo Building UHD...
+	my_echo "=============> THIS WILL TAKE SOME TIME <============="
+	my_echo
+	cd uhd/host
+	rm -rf build
+	if [ ! -d build ]
+	then
+		mkdir build
+	fi
+	cd build
+	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 $UCFLAGS ../ >>$LOGDEV 2>&1
+	make clean >>$LOGDEV 2>&1
+	make $JFLAG >>$LOGDEV 2>&1
+	if [ $? -ne 0  ]
+	then
+		my_echo UHD build apparently failed
+		my_echo Exiting UHD build
+		doexit UHD-BUILD-FAIL1
+	fi
+    sudo rm -f /usr/local/lib*/libuhd*
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	which uhd_find_devices >/dev/null 2>&1
+	x=$?
+	if [ $x -ne 0 -a ! -f /usr/local/bin/uhd_find_devices -a ! -f /opt/local/bin/uhd_find_devices ]
+	then
+		my_echo UHD build/install apparently failed since I cannot find /usr/local/bin/uhd_find_devices
+		my_echo after doing make and make install
+		my_echo Exiting UHD build
+		doexit UHD-BUILD-FAIL2
+	fi
+	sudo ldconfig >>$LOGDEV 2>&1
+	my_echo Done building/installing UHD
+}
+
+function firmware {
+	sudocheck
+	FOUND_DOWNLOADER=False
+	dirlist="/usr/local/share /usr/local/lib /usr/local/lib64"
+	prog=uhd_images_downloader
+	
+	PATH=$PATH:/usr/local/bin
+	q=`which $prog 2>/dev/null`
+	
+	if [ @$q@ != @@ ]
+	then
+		sudo -E $q
+	else
+		
+		for dir in $dirlist
+		do
+			if [ -f $dir/uhd/utils/$prog ]
+			then
+				FOUND_DOWNLOADER=True
+				DOWNLOADER=$dir/uhd/utils/$prog
+			fi
+		done
+		
+		if [ $FOUND_DOWNLOADER = True ]
+		then
+			sudo -E $DOWNLOADER
+		else
+			my_echo Could not find images downloader: $prog in any of $dirlist
+			doexit UHD-FIRMWARE-FAIL
+		fi
+		my_echo Done downloading firmware to /usr/local/share/uhd/images
+	fi
+}
+
+function gnuradio_build {
+	sudocheck
+	
+	if [ ! -d gnuradio ]
+	then
+		my_echo you do not appear to have the \'gnuradio\' directory
+		my_echo you should probably use $0 gitfetch to fetch the appropriate
+		my_echo files using GIT
+		doexit GNURADIO-BUILD-NOT-THERE
+	fi
+	if [ $GTAG != None ]
+	then
+		cd gnuradio
+		git checkout $GTAG >/dev/null 2>&1
+		cd ..
+	fi
+		
+	#
+	# LD stuff
+	#
+	echo /usr/local/lib >tmp$$
+	echo /usr/local/lib64 >>tmp$$
+
+	if grep -q /usr/local/lib /etc/ld.so.conf.d/*
+	then
+		my_echo /usr/local/lib already in ld.so.conf.d
+	else
+		sudo cp tmp$$ /etc/ld.so.conf.d/local.conf
+	fi
+	rm -f tmp$$
+	my_echo Doing ldconfig...
+	sudo ldconfig >/dev/null 2>&1
+
+	PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+	
+	if [ -d /usr/local/lib64/pkgconfig ]
+	then
+		PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig
+	fi
+	
+	export PKG_CONFIG_PATH
+	
+	#
+	# Build GNUradio
+	#
+	cd "$CWD"
+	cd gnuradio
+
+	my_echo Building GNU Radio...
+	my_echo "=========> THIS WILL TAKE QUITE A WHILE <============="
+	my_echo " "
+	my_echo ...Doing cmake
+	rm -rf build
+	mkdir build
+	cd build
+	my_echo ...Cmaking
+	cmake -DENABLE_BAD_BOOST=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 $GCFLAGS ../ >>$LOGDEV 2>&1
+	my_echo ...Building
+	make $JFLAG clean >>$LOGDEV 2>&1
+	make $JFLAG >>$LOGDEV 2>&1
+	if [ $? -ne 0 ]
+	then
+		my_echo make failed
+		my_echo Exiting GNU Radio build/install
+		doexit GNURADIO-BUILD-FAIL
+	fi
+	my_echo ...Installing
+	sudo rm -rf /usr/local/include/gnuradio/
+	sudo rm -f /usr/local/lib*/libgnuradio*
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	sudo ldconfig >>$LOGDEV 2>&1
+	my_echo Done building and installing GNU Radio
+	my_echo -n GRC freedesktop icons install ...
+	if [ -f /usr/local/libexec/gnuradio/grc_setup_freedesktop ]
+	then
+		sudo chmod 755 /usr/local/libexec/gnuradio/grc_setup_freedesktop
+		sudo /usr/local/libexec/gnuradio/grc_setup_freedesktop install >>$LOGDEV 2>&1
+	fi
+	my_echo Done
+}
+
+function rtl_build {
+	#
+	# RTL build
+	#
+	sudocheck
+	cd "$CWD"
+	if [ ! -d rtl-sdr ]
+	then
+		my_echo you do not appear to have the \'rtl-sdr\' directory
+		my_echo you should probably use $0 gitfetch to fetch the appropriate
+		my_echo files using GIT
+		doexit BUILD-RTL-NOT-THERE
+	fi
+	
+	my_echo -n Building rtl-sdr...
+	cd rtl-sdr
+	rm -rf build
+	mkdir -p build
+	cd build
+	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 -DINSTALL_UDEV_RULES=ON ../ >>$LOGDEV 2>&1
+	make clean >>$LOGDEV 2>&1
+	make $JFLAG >>$LOGDEV 2>&1
+
+	if [ $? -ne 0  ]
+	then
+		my_echo rtl-sdr build apparently failed
+		my_echo Exiting rtl-sdr build
+		doexit RTL-BUILD-FAIL1
+	fi
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	my_echo Done building rtl-sdr
+	
+	cd "$CWD"
+	if [ -d hackrf ]
+	then
+		my_echo -n Building hackrf...
+		cd hackrf/host/
+		rm -rf build
+		mkdir -p build
+		cd build
+		cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 -DINSTALL_UDEV_RULES=ON ../ >>$LOGDEV 2>&1
+		make clean >>$LOGDEV 2>&1
+		make >>$LOGDEV 2>&1
+		if [ $? -ne 0 ]
+		then
+			my_echo hackrf build failed
+			my_echo Exiting hackrf build
+			doexit HACKRF-BUILD-FAIL1
+		else
+			sudo make install >>$LOGDEV 2>&1
+		fi
+		my_echo Done building hackrf
+		cd "$CWD"
+	fi
+
+	cd "$CWD"
+	if [ -d gr-iqbal ]
+	then
+		my_echo -n Building gr-iqbal...
+		cd gr-iqbal
+		rm -rf build
+		mkdir -p build
+		cd build
+		cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 ../ >>$LOGDEV 2>&1
+		make clean >>$LOGDEV 2>&1
+		make >>$LOGDEV 2>&1
+		if [ $? -ne 0 ]
+		then
+			my_echo gr-iqbal build apparently failed
+			my_echo Exiting gr-iqbal build
+			doexit IQBAL-BUILD-FAIL1
+		else
+			sudo make install  >>$LOGDEV 2>&1
+			my_echo Done building gr-iqbal
+			cd "$CWD"
+		fi
+	fi
+
+	if [ -d bladeRF  ]
+	then
+		my_echo -n Building bladeRF...
+		cd bladeRF
+		cd host
+		rm -rf build
+		mkdir -p build
+		cd build
+		cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 ../ >>$LOGDEV 2>&1
+		make clean >>$LOGDEV 2>&1
+		make >>$LOGDEV 2>&1
+		if [ $? -ne 0 ]
+		then
+			my_echo bladeRF build apparently failed
+			my_echo Exiting bladeRF build
+			doexit BLADERF-BUILD-FAIL1
+		else
+			sudo make install >>$LOGDEV 2>&1
+			my_echo Done building bladeRF
+			cd "$CWD"
+		fi
+	fi
+	
+	if [ -d airspyone_host ]
+	then
+		cd airspyone_host
+		rm -rf build
+		mkdir build
+		cd build
+		cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 -DINSTALL_UDEV_RULES=ON ../ >>$LOGDEV 2>&1
+		make clean >>$LOGDEV 2>&1
+		make >>$LOGDEV 2>&1
+		if [ $? -ne 0 ]
+		then
+			my_echo airspyone_host build apparently failed
+			my_echo Exiting airspyone_host build
+			doexit AIRSPYONE-BUILD-FAIL1
+		else
+			sudo make install >>$LOGDEV 2>&1
+			my_echo Done building airspyone_host
+			cd "$CWD"
+		fi
+	fi
+	
+	cd "$CWD"
+	if [ ! -d gr-osmosdr ]
+	then
+		my_echo you do not appear to have the \'gr-osmosdr\' directory
+		my_echo you should probably use $0 gitfetch to fetch the appropriate
+		my_echo files using GIT
+		doexit RTL-BUILD-FAIL2
+	fi
+	cd gr-osmosdr
+	my_echo -n Building gr-osmosdr...
+	rm -rf build
+	mkdir build
+	cd build
+	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 ../ >>$LOGDEV  2>&1
+	make clean >>$LOGDEV 2>&1
+	make $JFLAG >>$LOGDEV 2>&1
+	
+	if [ $? -ne 0 ]
+	then
+		my_echo gr-osmosdr build apparently failed
+		my_echo Exit rtl-sdr/gr-osmosdr build
+		doexit OSMOSDR-BUILD-FAIL
+	fi
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	my_echo Done building gr-osmosdr
+	
+	cd "$CWD"
+	sudo ldconfig >>$LOGDEV 2>&1
+	my_echo Done building/installing rtl-sdr, gr-osmosdr, airspyone_host, bladeRF, hackrf, gr-iqbal.
+}
+
+function SoapySDR {
+	sudocheck
+	#
+	# SoapySDR build and install
+	#
+	cd "$CWD"
+	my_echo Building SoapySDR...
+	my_echo "=============> THIS WILL TAKE SOME TIME <============="
+	my_echo
+	cd SoapySDR
+	rm -rf build
+	mkdir build
+	cd build
+	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 ../ >>$LOGDEV 2>&1
+	make clean >>$LOGDEV 2>&1
+	make $JFLAG >>$LOGDEV 2>&1
+	if [ $? -ne 0  ]
+	then
+		my_echo SoapySDR build apparently failed
+		my_echo Exiting SoapySDR build
+		doexit SoapySDR-BUILD-FAIL1
+	fi
+
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	sudo ldconfig >>$LOGDEV 2>&1 
+	SoapySDRUtil --info
+	my_echo Done building/installing SoapySDR
+}
+
+function LimeSuite {
+	sudocheck
+	#
+	# LimeSuite build and install
+	#
+	cd "$CWD"
+	my_echo Building LimeSuite...
+	my_echo "=============> THIS WILL TAKE SOME TIME <============="
+	my_echo
+	cd LimeSuite
+	rm -rf builddir
+	mkdir builddir
+	cd builddir
+	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 ../ >>$LOGDEV 2>&1
+	make clean >>$LOGDEV 2>&1
+	make $JFLAG >>$LOGDEV 2>&1
+	if [ $? -ne 0  ]
+	then
+		my_echo LimeSuite build apparently failed
+		my_echo Exiting LimeSuite build
+		doexit LimeSuite-BUILD-FAIL1
+	fi
+
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	sudo ldconfig >>$LOGDEV 2>&1 
+	cd ../udev-rules
+	sudo bash install.sh >>$LOGDEV 2>&1
+	SoapySDRUtil --info
+	SoapySDRUtil --probe
+	my_echo Done building/installing LimeSuite
+}
+
+function G2RFID {
+	sudocheck
+	#
+	# Gen2 UHF RFID Reader build and install
+	#
+	cd "$CWD"
+	my_echo Building Gen2 UHF RFID Reader...
+	my_echo "=============> THIS WILL TAKE SOME TIME <============="
+	my_echo
+	cd gr-rfid
+	sudo rm -rf build
+	mkdir build
+	cd build
+	cmake $CMAKE_FLAG1 $CMAKE_FLAG2 $CMAKE_FLAG3 ../ >>$LOGDEV 2>&1
+
+	sudo make $JFLAG install >>$LOGDEV 2>&1
+	sudo ldconfig >>$LOGDEV 2>&1 
+	my_echo Done building/installing Gen2 UHF RFID Reader
+}
+
+function mod_groups {
+	sudocheck
+	#
+	# Post install stuff
+	#
+	# USRP rules for UDEV and USRP group
+	#
+	#
+	# Check for USRP group, and update if necessary
+	if grep -q usrp /etc/group
+	then
+		my_echo Group \'usrp\' already in /etc/group
+	else
+		sudo /usr/sbin/groupadd usrp
+	fi
+
+	#
+	# Check that our calling user is in the USRP group, update if necessary
+	#
+	if grep -q usrp.*${USER} /etc/group
+	then
+		my_echo User $USER already in group \'usrp\'
+	else
+		sudo /usr/sbin/usermod -a -G usrp $USER
+cat <<"!EOF!"
+********************************************************************************
+This script has just modified /etc/group to place your userid '('$USER')' into group 'usrp'
+In order for this change to take effect, you will need to log-out and log back
+in again.  You will not be able to access your USRP1 device until you do this.
+
+If you wish to allow others on your system to use the USRP1 device, you will need to use:
+
+  sudo usermod -a -G usrp userid
+  
+For each userid you wish to allow access to the usrp
+
+********************************************************************************
+
+Further 
+!EOF!
+	fi
+	if [ "$USERSLIST" = None ]
+	then
+		foo=bar
+	else
+		ul=`echo $USERSLIST|sed -e 's/,/ /g'`
+		for u in $ul
+		do
+			sudo /usr/sbin/usermod -a -G usrp $u
+			my_echo Added $u to group usrp
+		done
+	fi
+}
+
+function mod_udev {
+	sudocheck
+	#
+	# Check for UHD UDEV rules file, update if exists
+	#
+	if [ -f "$CWD"/uhd/host/utils/uhd-usrp.rules ]
+	then
+		sudo cp "$CWD"/uhd/host/utils/uhd-usrp.rules /etc/udev/rules.d/10-usrp.rules
+		sudo chown root /etc/udev/rules.d/10-usrp.rules
+		sudo chgrp root /etc/udev/rules.d/10-usrp.rules
+	fi
+
+	#
+	# Check for rtl-sdr UDEV rules file, update if exists
+	#
+	rm -f tmp$$
+	if [ -f "$CWD"/rtl-sdr/rtl-sdr.rules ]
+	then
+		sudo cp "$CWD"/rtl-sdr/rtl-sdr.rules /etc/udev/rules.d/15-rtl-sdr.rules
+		sudo chown root /etc/udev/rules.d/15-rtl-sdr.rules
+		sudo chgrp root /etc/udev/rules.d/15-rtl-sdr.rules
+	fi
+	sudo killall -HUP udevd
+	sudo udevadm control --reload-rules
+}
+
+function mod_sysctl {
+	sudocheck
+	#
+	# Modify sysctl.conf as necessary
+	#
+	cat >tmp$$ <<!EOF!
+# Updates for GNU Radio
+net.core.rmem_max = 1000000
+net.core.wmem_max = 1000000
+kernel.shmmax = 2147483648
+!EOF!
+
+
+	if grep -q 'Updates for GNU Radio' /etc/sysctl.conf
+	then
+		my_echo Required updates to /etc/sysctl.conf already in place
+	else
+		my_echo Applying updates to /etc/sysctl.conf
+		cat /etc/sysctl.conf tmp$$ >tmp2$$
+		chmod 644 tmp2$$
+		sudo mv tmp2$$ /etc/sysctl.conf
+	fi
+
+	sudo sysctl -w net.core.rmem_max=1000000 >/dev/null 2>&1
+	sudo sysctl -w net.core.wmem_max=1000000 >/dev/null 2>&1
+	sudo sysctl -w kernel.shmmax=2147483648  >/dev/null 2>&1
+	 
+	rm -f tmp$$
+	rm -f tmp2$$
+	
+	if grep -q usrp /etc/security/limits.conf
+	then
+		my_echo usrp group already has real-time scheduling privilege
+	else
+		cat >tmp$$ <<!EOF!
+@usrp  - rtprio 50
+!EOF!
+		cat /etc/security/limits.conf tmp$$ >tmp2$$
+		sudo cp tmp2$$ /etc/security/limits.conf
+		sudo chmod 644 /etc/security/limits.conf
+		rm -f tmp$$ tmp2$$
+		my_echo Group \'usrp\' now has real-time scheduling privileges
+		my_echo You will need to log-out and back in again for this to
+		my_echo take effect
+	fi
+}
+
+function pythonpath {
+	for PYVER in 3 3.6 3.7 3.8
+	do
+		for type in "" 64
+		do
+			if [ -d /usr/local/lib${type}/python${PYVER}/site-packages/gnuradio ]
+			then
+				PYTHONPATH=/usr/local/lib${type}/python${PYVER}/site-packages
+			fi
+			if [ -d /usr/local/lib${type}/python${PYVER}/dist-packages/gnuradio ]
+			then
+				PYTHONPATH=/usr/local/lib${type}/python${PYVER}/dist-packages
+			fi
+		done
+	done
+	echo
+	echo
+	echo "************************************************************"
+	echo You should probably set your PYTHONPATH to:
+	echo " "
+	echo "    " $PYTHONPATH
+	echo " "
+	echo Using:
+	echo " "
+	echo export PYTHONPATH=$PYTHONPATH
+	echo " "
+	echo in your .bashrc or equivalent file prior to attempting to run
+	echo any GNU Radio applications or GNU Radio Companion.
+	echo "*************************************************************"
+}
+
+function setenv {
+	echo
+	echo ==============================================================================
+	echo Attempting to set environment variables for terminal and 
+	echo graphical GNU Radio Companion export to ~/.bashrc and ~/.profile.
+	echo 
+	echo Ubuntu 20.04
+	echo 'export PYTHONPATH=/usr/local/lib/python3/dist-packages:/usr/local/lib/python3/site-packages:$PYTHONPATH'
+	echo 'export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH'
+	echo
+	echo Ubuntu 18.04
+	echo 'export PYTHONPATH=/usr/local/lib/python3.6/dist-packages:/usr/local/lib/python3.6/site-packages:$PYTHONPATH'
+	echo 'export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH'
+	echo 
+	echo Both
+	echo source ~/.bashrc
+	echo source ~/.profile
+	echo sudo ldconfig
+	echo 
+	echo ==============================================================================
+	echo -n "Proceed? (y / n) "
+
+	read ans
+	case $ans in
+		y|Y|YES|yes|Yes)
+			PROCEED=y
+		;;
+		*)
+			exit
+	esac
+	if [ -f /etc/lsb-release ]
+	then
+		case `grep DISTRIB_RELEASE /etc/lsb-release` in
+		*20.*)
+			echo 'export PYTHONPATH=/usr/local/lib/python3/dist-packages:/usr/local/lib/python3/site-packages:$PYTHONPATH' >> ~/.bashrc
+			echo 'export PYTHONPATH=/usr/local/lib/python3/dist-packages:/usr/local/lib/python3/site-packages:$PYTHONPATH' >> ~/.profile
+			;;
+
+		*18.*)
+			echo 'export PYTHONPATH=/usr/local/lib/python3.6/dist-packages:/usr/local/lib/python3.6/site-packages:$PYTHONPATH' >> ~/.bashrc
+			echo 'export PYTHONPATH=/usr/local/lib/python3.6/dist-packages:/usr/local/lib/python3.6/site-packages:$PYTHONPATH' >> ~/.profile
+			;;
+
+		*)
+			my_echo Your Ubuntu release not supported--cannot proceed
+			doexit WRONGRELEASE
+			;;
+		esac
+	echo 'export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+	echo 'export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH' >> ~/.profile
+	source ~/.bashrc
+	source ~/.profile
+	sudo ldconfig
+	echo Completed setting environment variables
+	fi
+
+}
+
+function do_an_extra {
+	if [ -e $1 ]
+	then
+		my_echo Building extra module $1
+		cd $1
+		if [  -f CMakeLists.txt ]
+		then
+			mkdir -p build >>$LOGDEV 2>&1
+			cd build
+			cmake $CMAKE_FLAGS1 $CMAKE_FLAGS2 $CMAKE_FLAG3 ../ >>$LOGDEV 2>&1
+			make >>$LOGDEV 2>&1
+			sudo make install >>$LOGDEV 2>&1
+			sudo ldconfig
+		elif [ - bootstrap ]
+		then
+			chmod 755 bootstrap
+			./bootstrap  >>$LOGDEV 2>&1
+			PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+			./configure >>$LOGDEV 2>&1
+			make >>$LOGDEV 2>&1
+			sudo make install >>$LOGDEV 2>&1
+			sudo ldconfig
+		else
+			my_echo Couldnt determine how to make module $1 neither bootstrap nor CmakeLists.txt present
+		fi
+	else
+		my_echo Couldnt build module $1 directory not there
+	fi
+}
+
+function extras {
+	sudocheck
+	date=`date +%Y%m%d%H%M%S`
+	if [ ! "@$EXTRAS@" = "@@" ]
+	then
+		for module in $EXTRAS
+		do
+			cd "$CWD"
+		    base=`basename $module .git`
+			case $module in
+			git:*|*.git|*github*)
+				mv $base $base.$date.bgmoved >>$LOGDEV 2>&1 
+				my_echo Doing GIT checkout for extra module $base
+				git clone $module  >>$LOGDEV 2>&1
+				do_an_extra $base
+				;;
+			htt*:*svn*)
+				mv $base $base.$date >>$LOGDEV 2>&1
+				my_echo Doing SVN checkout for extra module $base
+				svn co $module >>$LOGDEV 2>&1
+				if [ -e $base/trunk ]
+				then
+					do_an_extra $base/trunk
+				else
+					do_an_extra $base
+				fi
+				;;
+			*)
+				my_echo Ignoring malformed extra module $module
+				;;
+			esac
+			
+		done
+	fi
+	cd "$CWD"
+}
+
+function sudocheck {
+	#
+	# Check SUDO privileges
+	#
+	if [ $SUDOASKED = n ]
+	then
+		echo SUDO privileges are required 
+		echo -n "Do you have SUDO privileges? (y / n) "
+		read ans
+		case $ans in
+			y|Y|YES|yes|Yes)
+				echo Continuing with script
+				SUDOASKED=y
+				sudo grep timestamp_timeout /etc/sudoers >tmp$$
+				timeout=`cat tmp$$|awk '/./ {print $4}'`
+				rm -f tmp$$
+				if [ "@@" = "@$timeout@" ]
+				then
+					sudo cp /etc/sudoers tmp$$
+					sudo chown $USER tmp$$
+					sudo chmod 644 tmp$$
+					echo "Defaults  timestamp_timeout = 90" >>tmp$$
+					sudo cp tmp$$ /etc/sudoers
+					sudo chown root /etc/sudoers
+					sudo chmod 440 /etc/sudoers
+				elif [ "$timeout" -lt 90 ]
+				then
+					echo You need to have a timestamp_timeout in /etc/sudoers of 90 or more
+					echo Please ensure that your timestamp_timeout is 90 or more
+					exit
+				fi
+				;;
+			*)
+				echo Exiting.  Please ensure that you have SUDO privileges on this system!
+				exit
+				;;
+		esac
+	fi
+}
+
+function all {
+	installcheck
+	my_echo Starting all functions at: `date`
+	cd "$CWD"
+	prereqs
+	touch -d "15 minutes ago" touch$$
+	if [ -d uhd -a -d gnuradio ]
+	then
+		if [ uhd -ot touch$$ -o gnuradio -ot touch$$ ]
+		then
+			gitfetch
+		else
+			my_echo Skipping git fetch, since \'uhd\' and \'gnuradio\' are new enough
+		fi
+	else
+		gitfetch
+	fi
+	rm -f touch$$
+	for fcn in uhd_build firmware gnuradio_build rtl_build SoapySDR LimeSuite G2RFID mod_groups mod_udev mod_sysctl pythonpath setenv extras
+	do
+		my_echo Starting function $fcn at: `date`
+		cd "$CWD"
+		$fcn
+		my_echo Done function $fcn at: `date`
+	done
+	my_echo Done all functions at: `date`
+}
+
+function uninstall {
+	echo ==============================================================================
+	echo This script will uninstall all packages, remove all downloaded packages and build files.
+	echo
+	echo CWD: "$CWD"
+	echo JFLAG: "$JFLAG"
+	echo DRYRUN: "$DRYRUN"
+	echo VERBOSE: "$VERBOSE"
+	echo ==============================================================================
+	echo
+	echo -n "Proceed? (y / n) "
+	read ans
+	case $ans in
+		y|Y|YES|yes|Yes)
+			PROCEED=y
+		;;
+		*)
+			exit
+	esac
+
+	sudocheck
+	my_echo
+
+	cd "$CWD"
+	if [ -d rtl-sdr ]
+	then
+		my_echo Uninstalling rtl-sdr...
+		cd rtl-sdr
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling rtl-sdr
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d gr-iqbal ]
+	then
+		my_echo Uninstalling gr-iqbal...
+		cd gr-iqbal
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling gr-iqbal
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d gr-osmosdr ]
+	then
+		my_echo Uninstalling gr-osmosdr...
+		cd gr-osmosdr
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling gr-osmosdr
+		my_echo
+	fi
+	
+	cd "$CWD"
+	if [ -d hackrf ]
+	then
+		my_echo Uninstalling hackrf...
+		cd hackrf
+		cd host
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling hackrf
+		my_echo
+		cd "$CWD"
+	fi
+
+	cd "$CWD"
+	if [ -d bladeRF ]
+	then
+		my_echo Uninstalling bladeRF...
+		cd bladeRF
+		cd host
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling bladeRF
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d airspyone_host ]
+	then
+		my_echo Uninstalling airspyone_host...
+		cd airspyone_host
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling airspyone_host
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d SoapySDR ]
+	then
+		my_echo Uninstalling SoapySDR...
+		cd SoapySDR
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling SoapySDR
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d LimeSuite ]
+	then
+		my_echo Uninstalling LimeSuite...
+		cd LimeSuite
+		cd builddir
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling LimeSuite
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d gr-rfid/build/ ]
+	then
+		my_echo Uninstalling gr-rfid...
+		cd gr-rfid
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling gr-rfid
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d uhd ]
+	then
+		my_echo Uninstalling uhd...
+		cd uhd
+		cd host
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling uhd
+		my_echo
+	fi
+
+	cd "$CWD"
+	if [ -d gnuradio ]
+	then
+		my_echo Uninstalling gnuradio...
+		cd gnuradio
+		cd build
+		sudo make $DRYRUN $JFLAG uninstall >>$LOGDEV 2>&1
+		my_echo Done uninstalling gnuradio
+		my_echo
+	fi
+	
+	cd "$CWD"
+	my_echo Done uninstalling uhd, gnuradio, rtl-sdr, gr-osmosdr, gr-iqbal, hackrf, bladeRF, airspyone_host, SoapySDR, LimeSuite, G2RFID.
+	my_echo
+	my_echo Removing all downloaded packages and build files.
+	if [ "$DRYRUN" != -n ]
+	then
+		sudo rm -rf rtl-sdr
+		sudo rm -rf gr-osmosdr
+		sudo rm -rf gr-iqbal
+		sudo rm -rf hackrf
+		sudo rm -rf bladeRF
+		sudo rm -rf airspyone_host
+		sudo rm -rf SoapySDR
+		sudo rm -rf LimeSuite
+		sudo rm -rf gr-rfid/build
+		sudo rm -rf uhd
+		sudo rm -rf gnuradio
+		my_echo Done removing all downloaded packages and build files.
+	else
+		my_echo dry-run is on, skip removing all downloaded packages and build files.
+	fi
+
+}
+
+PATH=$PATH
+export PATH
+case $# in
+	0)
+		all
+		my_echo
+		my_echo You may wish to run the following commands after connecting LimeSDR:
+		my_echo SoapySDRUtil --info
+		my_echo SoapySDRUtil --probe
+		my_echo All Done
+		doexit SUCCESS
+esac
+
+for arg in $*
+do
+	my_echo Starting function $fcn at: `date`
+	cd "$CWD"
+	$arg
+	my_echo Done function $fcn at: `date`
+done
+
+my_echo 
+my_echo All Done
+doexit SUCCESS
