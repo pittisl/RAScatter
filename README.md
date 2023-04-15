@@ -6,7 +6,7 @@ This repository contains the source code for paper "RAScatter: Achieving Energy-
 
 :relieved: ***Sadly, our efforts were paid towards a wrong direction***: Most people think it's unnecessary to save reader's RF power since they are usually plugged into the wall, though it could benefit several [portable readers](https://www.atlasrfidstore.com/handheld-rfid-readers/).
 
-:relaxed: The main purpose of this code releasing is to demonstrate we indeed built an end-to-end system where AI and backscatter are magically integrated together, though in a less recognized way. The tag's code looks fine, but the reader's and NN's training code looks messy. I may find sometime to clean them up in the future.
+:relaxed: The code is less likely to be reused. The main purpose of this code releasing is to tell we indeed built an end-to-end system where AI and backscatter are magically integrated together, though in a less recognized way. The tag's code looks fine, but the reader's and NN's training code looks messy. I may find sometime to clean them up in the future.
 
 # Citation
 :hugs: If you find our efforts inspired your work, please kindly cite our paper:
